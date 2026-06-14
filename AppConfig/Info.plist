@@ -42,6 +42,8 @@
 	<string>com.ryuseiokada.englishwordapp.premium.monthly1080</string>
 	<key>PREMIUM_YEARLY_PRODUCT_ID</key>
 	<string>com.ryuseiokada.englishwordapp.premium.yearly9800</string>
+	<key>WORD_ENTRY_API_BASE_URL</key>
+	<string>https://wordstep-backend.onrender.com</string>
 	<key>SKAdNetworkItems</key>
 	<array>
 		<dict>
