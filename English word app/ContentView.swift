@@ -21,9 +21,11 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
+    @Environment(\.colorScheme) private var colorScheme
     @Query(sort: \WordEntry.createdAt, order: .forward) private var entries: [WordEntry]
     @StateObject private var subscriptionManager = SubscriptionManager()
     @StateObject private var usageQuotaManager = UsageQuotaManager()
+    @StateObject private var aiTestQuotaManager = AITestQuotaManager()
     @StateObject private var rewardedAdManager = RewardedAdManager()
 
     @State private var inputWord = ""
@@ -38,48 +40,85 @@ struct ContentView: View {
     @State private var savedStatusMessage: String?
     @State private var hasSeededPreviewQuota = false
     @State private var selectedListCategory: EntryKind = .word
+    @State private var selectedTestFilter: TestEntryFilter = .word
+    @State private var testUsesPrimaryMeaningOnly = true
+    @State private var testGeneratesExamplesOnTheFly = false
+    @State private var testRangeStart = 1
+    @State private var testRangeEnd = 1
+    @State private var premiumTestQuestionCount = 10
+    @State private var activeTestSession: AITestSession?
+    @State private var testMessage: String?
+    @State private var isPreparingTest = false
     @FocusState private var focusedField: FocusedField?
 #if os(iOS)
     @State private var isKeyboardVisible = false
 #endif
 
     private let generator: any WordEntryGenerating
+    private let aiTestGenerator: any AITestGenerating
     private let isGeneratorAvailable = WordEntryGeneratorFactory.isAvailable
     private let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
 
-    init(generator: any WordEntryGenerating = WordEntryGeneratorFactory.makeGenerator()) {
+    init(
+        generator: any WordEntryGenerating = WordEntryGeneratorFactory.makeGenerator(),
+        aiTestGenerator: any AITestGenerating = BackendAITestGenerator()
+    ) {
         self.generator = generator
+        self.aiTestGenerator = aiTestGenerator
     }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            createTab
-                .tabItem {
-                    Label("作成", systemImage: "sparkles")
-                }
-                .tag(AppTab.create)
+        VStack(spacing: 0) {
+            TabView(selection: $selectedTab) {
+                createTab
+                    .tabItem {
+                        Label("作成", systemImage: "sparkles")
+                    }
+                    .tag(AppTab.create)
 
-            searchTab
-                .tabItem {
-                    Label("検索", systemImage: "magnifyingglass")
-                }
-                .tag(AppTab.search)
+                searchTab
+                    .tabItem {
+                        Label("検索", systemImage: "magnifyingglass")
+                    }
+                    .tag(AppTab.search)
 
-            listTab
-                .tabItem {
-                    Label("一覧", systemImage: "list.bullet")
-                }
-                .tag(AppTab.list)
+                listTab
+                    .tabItem {
+                        Label("一覧", systemImage: "list.bullet")
+                    }
+                    .tag(AppTab.list)
 
-            testTab
-                .tabItem {
-                    Label("テスト", systemImage: "text.book.closed")
-                }
-                .tag(AppTab.test)
+                testTab
+                    .tabItem {
+                        Label("テスト", systemImage: "text.book.closed")
+                    }
+                    .tag(AppTab.test)
+            }
+
         }
         .sheet(isPresented: $isShowingSettings) {
             settingsSheet
         }
+        .sheet(item: $selectedLegalPage) { legalPage in
+#if os(iOS)
+            LegalPageSafariView(url: legalPage.url)
+                .ignoresSafeArea()
+#else
+            EmptyView()
+#endif
+        }
+        .fullScreenCover(isPresented: $rewardedAdManager.isShowingSimulationAd) {
+            rewardedAdSimulationView
+        }
+#if os(iOS)
+        .fullScreenCover(isPresented: $isShowingPremiumDetails) {
+            premiumDetailsSheet
+        }
+#else
+        .sheet(isPresented: $isShowingPremiumDetails) {
+            premiumDetailsSheet
+        }
+#endif
         .task {
             guard isPreview == false else {
                 seedPreviewQuotaIfNeeded()
@@ -88,11 +127,14 @@ struct ContentView: View {
 
             await subscriptionManager.prepare()
             usageQuotaManager.refresh()
+            aiTestQuotaManager.refresh()
+            await TrackingPermissionManager.requestIfNeeded()
             rewardedAdManager.prepare()
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 usageQuotaManager.refresh()
+                aiTestQuotaManager.refresh()
             }
         }
 #if os(iOS)
@@ -109,15 +151,19 @@ struct ContentView: View {
     private var settingsSheet: some View {
         NavigationStack {
             List {
-                Section("Premium") {
-                    settingsValueRow(
-                        title: "利用プラン",
-                        value: subscriptionManager.hasPremiumAccess ? "Premium" : "無料"
-                    )
-
-                    Button("Premiumの詳細") {
-                        isShowingPremiumDetails = true
+                Section {
+                    Button {
+                        isShowingSettings = false
+                        DispatchQueue.main.async {
+                            isShowingPremiumDetails = true
+                        }
+                    } label: {
+                        settingsActionRow(
+                            title: "Premiumプラン",
+                            systemImage: "sparkles"
+                        )
                     }
+                    .buttonStyle(.plain)
 
                     Button(subscriptionManager.isRestoring ? "復元中..." : "購入を復元") {
                         Task {
@@ -127,28 +173,10 @@ struct ContentView: View {
                     .disabled(subscriptionManager.isRestoring || subscriptionManager.isLoading)
                 }
 
-                Section("利用状況") {
-                    settingsValueRow(title: "残り作成回数", value: remainingCreationCountText)
-                    settingsValueRow(title: "登録済み単語", value: "\(wordEntryCount)件")
-                    settingsValueRow(title: "登録済み熟語", value: "\(phraseEntryCount)件")
-                }
-
-                Section("サポート") {
-                    settingsValueRow(title: "AI生成", value: "OpenAI")
-                    settingsValueRow(title: "広告追加", value: "1回で3回追加")
-                    settingsValueRow(title: "Premium内容", value: "広告なし・AI自動テスト")
-                }
-
-                Section("法務・お問い合わせ") {
+                Section("ヘルプ") {
                     settingsLegalRow(title: "利用規約", path: "terms.html")
                     settingsLegalRow(title: "プライバシーポリシー", path: "privacy.html")
                     settingsLegalRow(title: "お問い合わせ", path: "contact.html")
-                }
-
-                Section("アプリ情報") {
-                    settingsValueRow(title: "アプリ名", value: "English word app")
-                    settingsValueRow(title: "バージョン", value: appVersionText)
-                    settingsValueRow(title: "ビルド", value: appBuildText)
                 }
             }
             .navigationTitle("設定")
@@ -162,53 +190,307 @@ struct ContentView: View {
                     }
                 }
             }
-            .sheet(item: $selectedLegalPage) { legalPage in
-#if os(iOS)
-                LegalPageSafariView(url: legalPage.url)
-                    .ignoresSafeArea()
-#else
-                EmptyView()
-#endif
-            }
         }
     }
 
     private var testTab: some View {
         NavigationStack {
-            Color.clear
-                .ignoresSafeArea()
-                .navigationTitle("テスト")
-                .toolbar {
-                    settingsToolbarButton
+            VStack(spacing: 0) {
+                testFilterTabs
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 0)
+
+                if filteredTestEntries.isEmpty {
+                    listEmptyStateCard(message: "保存した英単語や英熟語がまだありません。")
+                        .padding(.horizontal, 16)
+
+                    Spacer(minLength: 0)
+                } else {
+                    List {
+                        if let activeTestSession {
+                            testSessionSection(activeTestSession)
+                        } else {
+                            Section {
+                                VStack(alignment: .leading, spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        HStack(spacing: 8) {
+                                            Text("左")
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 28, alignment: .leading)
+
+                                            testRangeInlineSummary(
+                                                number: testRangeStart,
+                                                word: testRangeEntryTitle(for: testRangeStart)
+                                            )
+
+                                            Spacer(minLength: 0)
+                                        }
+
+                                        HStack(spacing: 10) {
+                                            Spacer(minLength: 0)
+                                            rangeAdjustButton(title: "-100", action: { adjustTestRangeStart(by: -100) })
+                                            rangeAdjustButton(title: "-10", action: { adjustTestRangeStart(by: -10) })
+                                            rangeAdjustButton(title: "-", action: { adjustTestRangeStart(by: -1) })
+                                            rangeAdjustButton(title: "+", action: { adjustTestRangeStart(by: 1) })
+                                            rangeAdjustButton(title: "+10", action: { adjustTestRangeStart(by: 10) })
+                                            rangeAdjustButton(title: "+100", action: { adjustTestRangeStart(by: 100) })
+                                            Spacer(minLength: 0)
+                                        }
+                                    }
+
+                                    Divider()
+
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        HStack(spacing: 8) {
+                                            Text("右")
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 28, alignment: .leading)
+
+                                            testRangeInlineSummary(
+                                                number: testRangeEnd,
+                                                word: testRangeEntryTitle(for: testRangeEnd)
+                                            )
+
+                                            Spacer(minLength: 0)
+                                        }
+
+                                        HStack(spacing: 10) {
+                                            Spacer(minLength: 0)
+                                            rangeAdjustButton(title: "-100", action: { adjustTestRangeEnd(by: -100) })
+                                            rangeAdjustButton(title: "-10", action: { adjustTestRangeEnd(by: -10) })
+                                            rangeAdjustButton(title: "-", action: { adjustTestRangeEnd(by: -1) })
+                                            rangeAdjustButton(title: "+", action: { adjustTestRangeEnd(by: 1) })
+                                            rangeAdjustButton(title: "+10", action: { adjustTestRangeEnd(by: 10) })
+                                            rangeAdjustButton(title: "+100", action: { adjustTestRangeEnd(by: 100) })
+                                            Spacer(minLength: 0)
+                                        }
+                                    }
+
+                                    Divider()
+
+                                    HStack {
+                                        Text("出題範囲")
+                                        Spacer()
+                                        Text("\(testRangeStart) 〜 \(testRangeEnd)")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .font(.body.weight(.medium))
+
+                                    Divider()
+
+                                    Toggle(isOn: $testUsesPrimaryMeaningOnly) {
+                                        Text("主な意味のみ")
+                                    }
+
+                                    Divider()
+
+                                    Toggle(isOn: $testGeneratesExamplesOnTheFly) {
+                                        Text("その場で作成")
+                                    }
+                                    .disabled(subscriptionManager.hasPremiumAccess == false)
+
+                                    Divider()
+
+                                    Group {
+                                        if subscriptionManager.hasPremiumAccess {
+                                            Stepper(
+                                                value: premiumQuestionCountBinding,
+                                                in: 1...max(availableQuestionSourceCount, 1)
+                                            ) {
+                                                HStack {
+                                                    Text("問題数")
+                                                    Spacer()
+                                                    Text("\(effectiveQuestionCount)問")
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                            }
+                                        } else {
+                                            VStack(alignment: .leading, spacing: 8) {
+                                                HStack {
+                                                    Text("問題数")
+                                                    Spacer()
+                                                    Text("\(effectiveQuestionCount)問")
+                                                        .foregroundStyle(.secondary)
+                                                }
+
+                                                if availableSelectedEntryCount < 10 {
+                                                    Text(freeTestRangeRequirementMessage)
+                                                        .font(.footnote)
+                                                        .foregroundStyle(.red)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if subscriptionManager.hasPremiumAccess == false {
+                                        Divider()
+
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            Text("テスト回数: 残り\(aiTestQuotaManager.remainingTests)回")
+                                                .font(.footnote.weight(.semibold))
+
+                                            if aiTestQuotaManager.remainingTests == 0 {
+                                                Text("無料テスト回数を使い切りました。広告を視聴するとテスト回数が2回追加されます。")
+                                                    .font(.footnote)
+                                                    .foregroundStyle(.secondary)
+
+                                                Button("広告を見て2回追加") {
+                                                    Task {
+                                                        let isRewardEarned = await rewardedAdManager.showRewardedAd()
+                                                        if isRewardEarned {
+                                                            aiTestQuotaManager.addRewardedTest()
+                                                            testMessage = nil
+                                                        }
+                                                    }
+                                                }
+                                                .buttonStyle(.borderedProminent)
+                                                .tint(.blue)
+                                            }
+                                        }
+                                    }
+
+                                    Divider()
+
+                                    Button(isPreparingTest ? "テスト準備中..." : "テスト開始") {
+                                        Task {
+                                            await startAITest()
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(canStartAITest == false || isPreparingTest)
+                                }
+                            }
+
+                            if let testMessage {
+                                Section {
+                                    Text(testMessage)
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+
+                        if shouldShowBannerAd, activeTestSession != nil {
+                            Section {
+                                NativeAdPlacement(
+                                    outerHorizontalPadding: 20,
+                                    topSpacing: 4,
+                                    bottomSpacing: 4
+                                )
+                                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                                .listRowBackground(Color.clear)
+                                .listRowSeparator(.hidden)
+                            }
+                        }
+                    }
                 }
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+#if os(iOS)
+            .listSectionSpacing(0)
+#endif
+            .safeAreaInset(edge: .top, spacing: 0) {
+                topBarHeader(title: "テスト")
+                    .padding(.bottom, 8)
+                    .background(Color(uiColor: .systemGroupedBackground))
+            }
+            .toolbar(.hidden, for: .navigationBar)
+            .onAppear {
+                syncTestRangeSelection(resetToFullRange: true)
+            }
+            .onChange(of: selectedTestFilter) { _, _ in
+                syncTestRangeSelection(resetToFullRange: true)
+            }
+            .onChange(of: entries.count) { _, _ in
+                syncTestRangeSelection(resetToFullRange: false)
+            }
         }
+    }
+
+    private var testFilterTabs: some View {
+        HStack(spacing: 0) {
+            testFilterTabButton(title: TestEntryFilter.word.label, filter: .word)
+            testFilterTabButton(title: TestEntryFilter.phrase.label, filter: .phrase)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(1)
+        .background(Color.secondary.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func testFilterTabButton(title: String, filter: TestEntryFilter) -> some View {
+        let isSelected = selectedTestFilter == filter
+
+        return Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                selectedTestFilter = filter
+            }
+        } label: {
+            Text(title)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(
+                    isSelected
+                    ? (colorScheme == .dark ? Color.white.opacity(0.96) : Color.black)
+                    : (colorScheme == .dark ? Color.white.opacity(0.82) : Color.secondary)
+                )
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(
+                            isSelected
+                            ? (colorScheme == .dark
+                                ? Color.secondary.opacity(0.08)
+                                : Color.white)
+                            : Color.clear
+                        )
+                )
+        }
+        .buttonStyle(.plain)
     }
 
     private var createTab: some View {
         NavigationStack {
-            List {
-                inputSection
+            VStack(spacing: 0) {
+                List {
+                    inputSection
 
-                if let generatedDraft {
-                    generatedSection(
-                        draft: generatedDraft,
-                        visibleSenses: visibleSenses(for: generatedDraft)
-                    )
+                    if shouldShowBannerAd {
+                        Section {
+                            NativeAdPlacement(
+                                outerHorizontalPadding: 20,
+                                topSpacing: 0,
+                                bottomSpacing: 4
+                            )
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                        }
+                        .listSectionSeparator(.hidden, edges: .top)
+                    }
+
+                    if let generatedDraft {
+                        generatedSection(
+                            draft: generatedDraft,
+                            visibleSenses: visibleSenses(for: generatedDraft)
+                        )
+                    }
                 }
+                .listSectionSpacing(4)
             }
 #if os(iOS)
             .scrollDismissesKeyboard(.immediately)
-            .background(KeyboardDismissOnTapView {
-                dismissKeyboard()
-            })
+            .safeAreaInset(edge: .top, spacing: 0) {
+                topBarHeader(title: "作成")
+                    .padding(.bottom, 0)
+                    .background(Color(uiColor: .systemGroupedBackground))
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 keyboardDismissBar
             }
 #endif
-            .navigationTitle("作成")
-            .toolbar {
-                settingsToolbarButton
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .onAppear {
                 if isPreview {
                     seedPreviewQuotaIfNeeded()
@@ -223,28 +505,46 @@ struct ContentView: View {
 
     private var listTab: some View {
         NavigationStack {
-            List {
+            VStack(spacing: 0) {
                 listCategoryTabs
-                .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 0, trailing: 4))
-                .listRowBackground(Color.clear)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 18)
 
-                savedWordsSection
+                if filteredListEntries.isEmpty {
+                    listEmptyStateCard(
+                        message: selectedListCategory == .word
+                        ? "英単語はまだありません"
+                        : "英熟語はまだありません"
+                    )
+                    .padding(.horizontal, 16)
+
+                    Spacer(minLength: 0)
+                } else {
+                    List {
+                        savedWordsSection
+                    }
+                }
             }
+            .background(Color(uiColor: .systemGroupedBackground))
 #if os(iOS)
             .listSectionSpacing(8)
-#endif
-            .navigationTitle("一覧")
-            .toolbar {
-                settingsToolbarButton
+            .safeAreaInset(edge: .top, spacing: 0) {
+                topBarHeader(title: "一覧")
+                    .padding(.bottom, 8)
+                    .background(Color(uiColor: .systemGroupedBackground))
             }
+#endif
+            .toolbar(.hidden, for: .navigationBar)
         }
     }
 
     private var listCategoryTabs: some View {
         HStack(spacing: 0) {
-            listCategoryTabButton(title: "単語", category: .word)
-            listCategoryTabButton(title: "熟語", category: .phrase)
+            listCategoryTabButton(title: "英単語", category: .word)
+            listCategoryTabButton(title: "英熟語", category: .phrase)
         }
+        .frame(maxWidth: .infinity)
         .padding(1)
         .background(Color.secondary.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -260,12 +560,22 @@ struct ContentView: View {
         } label: {
             Text(title)
                 .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                .foregroundStyle(
+                    isSelected
+                    ? (colorScheme == .dark ? Color.white.opacity(0.96) : Color.black)
+                    : (colorScheme == .dark ? Color.white.opacity(0.82) : Color.secondary)
+                )
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
+                .padding(.vertical, 3)
                 .background(
                     RoundedRectangle(cornerRadius: 13, style: .continuous)
-                        .fill(isSelected ? Color.white : Color.clear)
+                        .fill(
+                            isSelected
+                            ? (colorScheme == .dark
+                                ? Color.secondary.opacity(0.08)
+                                : Color.white)
+                            : Color.clear
+                        )
                 )
         }
         .buttonStyle(.plain)
@@ -273,62 +583,137 @@ struct ContentView: View {
 
     private var searchTab: some View {
         NavigationStack {
-            List {
-                Section {
-                    TextField("英単語または熟語を検索", text: searchBinding)
-                        .autocorrectionDisabled()
-                        .focused($focusedField, equals: .searchInput)
+            VStack(spacing: 0) {
+                List {
+                    Section {
+                        TextField("", text: searchBinding, prompt: Text("英単語または英熟語を検索").foregroundStyle(emptyStateTextColor))
+                            .autocorrectionDisabled()
+                            .focused($focusedField, equals: .searchInput)
 #if os(iOS)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.asciiCapable)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.asciiCapable)
 #endif
+                    }
+
+                    if searchResults.isEmpty {
+                        if searchText.isEmpty {
+                            Text("保存した英単語や英熟語を検索できます。")
+                                .font(.footnote)
+                                .foregroundStyle(emptyStateTextColor)
+                        } else {
+                            Text("一致する英単語や英熟語はありません。")
+                                .font(.footnote)
+                                .foregroundStyle(emptyStateTextColor)
+                        }
+                    } else {
+                        searchResultsSection
+                    }
+
+                    if shouldShowBannerAd {
+                        Section {
+                            NativeAdPlacement(
+                                outerHorizontalPadding: 20,
+                                topSpacing: 0,
+                                bottomSpacing: 4
+                            )
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                        }
+                    }
                 }
 
-                if searchResults.isEmpty {
-                    if searchText.isEmpty {
-                        Text("保存した単語や熟語を検索できます。")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("一致する単語や熟語はありません。")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                } else {
-                    searchResultsSection
-                }
             }
 #if os(iOS)
             .listSectionSpacing(8)
-#endif
-#if os(iOS)
             .scrollDismissesKeyboard(.immediately)
-            .background(KeyboardDismissOnTapView {
-                dismissKeyboard()
-            })
+            .safeAreaInset(edge: .top, spacing: 0) {
+                topBarHeader(title: "検索")
+                    .padding(.bottom, 0)
+                    .background(Color(uiColor: .systemGroupedBackground))
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 keyboardDismissBar
             }
 #endif
-            .navigationTitle("検索")
-            .toolbar {
-                settingsToolbarButton
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .onAppear {
                 restoreFocusIfNeeded(.searchInput)
             }
         }
     }
 
-    @ToolbarContentBuilder
-    private var settingsToolbarButton: some ToolbarContent {
-        ToolbarItem(placement: .primaryAction) {
-            Button {
-                isShowingSettings = true
-            } label: {
-                Image(systemName: "gearshape")
+    private func rangeAdjustButton(title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.primary)
+                .frame(minWidth: 42, minHeight: 34)
+                .background(
+                    Capsule()
+                        .fill(Color(uiColor: .secondarySystemBackground))
+                )
+                .overlay(
+                    Capsule()
+                        .stroke(Color(uiColor: .separator).opacity(0.22), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.12 : 0.05), radius: 6, y: 2)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func topBarHeader(title: String) -> some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.system(size: 32, weight: .bold))
+                .foregroundStyle(.primary)
+
+            Spacer(minLength: 0)
+
+            HStack(spacing: 10) {
+                Button {
+                    isShowingPremiumDetails = true
+                } label: {
+                    premiumSparklesIcon(size: 44, iconSize: 20, cornerRadius: 16)
+                }
+                .accessibilityLabel("Premiumプラン")
+
+                Button {
+                    isShowingSettings = true
+                } label: {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundStyle(Color(uiColor: .darkGray))
+                        .frame(width: 48, height: 48)
+                }
+                .accessibilityLabel("設定")
             }
         }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+    }
+
+    private func testRangeInlineSummary(number: Int, word: String) -> some View {
+        HStack(spacing: 8) {
+            Text("\(number)")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(Color.blue)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule()
+                        .fill(Color.blue.opacity(colorScheme == .dark ? 0.18 : 0.12))
+                )
+
+            Text(word)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+                .foregroundStyle(.primary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     private var topHeaderSection: some View {
@@ -348,7 +733,7 @@ struct ContentView: View {
             } label: {
                 homeShortcutCard(
                     title: "作成",
-                    description: "英単語や熟語から意味と例文を作成します。",
+                    description: "英単語や英熟語から意味と例文を作成します。",
                     systemImage: "sparkles"
                 )
             }
@@ -359,7 +744,7 @@ struct ContentView: View {
             } label: {
                 homeShortcutCard(
                     title: "検索",
-                    description: "保存済みの単語や熟語をすぐに探せます。",
+                    description: "保存済みの英単語や英熟語をすぐに探せます。",
                     systemImage: "magnifyingglass"
                 )
             }
@@ -370,7 +755,7 @@ struct ContentView: View {
             } label: {
                 homeShortcutCard(
                     title: "一覧",
-                    description: "英単語と熟語を分けてまとめて見られます。",
+                    description: "英単語と英熟語を分けてまとめて見られます。",
                     systemImage: "list.bullet"
                 )
             }
@@ -380,7 +765,7 @@ struct ContentView: View {
 
     private var inputSection: some View {
         Section {
-            TextField("英単語または熟語を入力", text: $inputWord)
+            TextField("", text: $inputWord, prompt: Text("英単語または英熟語を入力").foregroundStyle(emptyStateTextColor))
                 .autocorrectionDisabled()
                 .focused($focusedField, equals: .createInput)
 #if os(iOS)
@@ -399,7 +784,12 @@ struct ContentView: View {
                     Text(isGenerating ? "作成中..." : "作成")
                 }
             }
-            .disabled(isGenerating || isGeneratorAvailable == false)
+            .disabled(
+                isGenerating ||
+                inputWord.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                isGeneratorAvailable == false ||
+                (subscriptionManager.hasPremiumAccess == false && usageQuotaManager.remainingCreations <= 0)
+            )
 
             Text(availabilityMessage)
                 .font(.footnote)
@@ -440,7 +830,7 @@ struct ContentView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
 
-                Button(rewardedAdManager.isLoading ? "広告を読み込み中..." : "広告を見て3回追加") {
+                Button("広告を見て3回追加") {
                     Task {
                         let isRewardEarned = await rewardedAdManager.showRewardedAd()
                         if isRewardEarned {
@@ -451,7 +841,78 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
-                .disabled(rewardedAdManager.isLoading)
+            }
+        }
+    }
+
+    private var rewardedAdSimulationView: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color.black, Color(red: 0.08, green: 0.08, blue: 0.1)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 20) {
+                HStack {
+                    Spacer()
+                    Button {
+                        rewardedAdManager.dismissSimulationAd()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 42, height: 42)
+                            .background(Color.white.opacity(0.14), in: Circle())
+                    }
+                }
+                .padding(.horizontal, 20)
+
+                Spacer()
+
+                VStack(spacing: 18) {
+                    Text("テスト用リワード広告")
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(.white)
+
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.orange.opacity(0.95), Color.yellow.opacity(0.82)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(height: 220)
+                        .overlay {
+                            VStack(spacing: 12) {
+                                Image(systemName: "play.rectangle.fill")
+                                    .font(.system(size: 54))
+                                    .foregroundStyle(.white)
+                                Text("広告動画")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+
+                    Text("シミュレータではこのテスト広告画面を表示しています。視聴完了で回数が追加されます。")
+                        .font(.body)
+                        .foregroundStyle(.white.opacity(0.84))
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 24)
+
+                Spacer()
+
+                Button("視聴完了して回数追加") {
+                    rewardedAdManager.completeSimulationAd()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+                .controlSize(.large)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 40)
             }
         }
     }
@@ -611,36 +1072,20 @@ struct ContentView: View {
                     }
                 }
         )
-#if os(iOS)
-        .fullScreenCover(isPresented: $isShowingPremiumDetails) {
-            premiumDetailsSheet
-        }
-#else
-        .sheet(isPresented: $isShowingPremiumDetails) {
-            premiumDetailsSheet
-        }
-#endif
     }
 
     private var premiumDetailsSheet: some View {
         NavigationStack {
-            List {
-                Section {
-                    Label("広告なしで利用", systemImage: "checkmark.circle.fill")
-                    Label("AI自動テスト機能", systemImage: "checkmark.circle.fill")
-                    Label("今後のPremium向け機能追加", systemImage: "checkmark.circle.fill")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    premiumFeatureCard
+                    premiumPurchaseCard
                 }
-
-                Section {
-                    Button(subscriptionManager.isPurchasing ? "購入中..." : "Premiumをはじめる") {
-                        Task {
-                            await subscriptionManager.purchasePremium()
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(subscriptionManager.isPurchasing || subscriptionManager.isLoading)
-                }
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+                .padding(.bottom, 24)
             }
+            .background(Color(uiColor: .systemGroupedBackground))
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button {
@@ -653,6 +1098,179 @@ struct ContentView: View {
             }
         }
     }
+
+    private var premiumFeatureCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            premiumFeatureRow(
+                iconName: "eye.slash.fill",
+                title: "広告非表示",
+                description: "作成・検索・一覧・テストを広告なしで使えます。"
+            )
+            premiumFeatureRow(
+                iconName: "slider.horizontal.3",
+                title: "問題数の調整",
+                description: "テストで出したい問題数を自由に調整しながら、自分に合ったペースで学習できます。"
+            )
+            premiumFeatureRow(
+                iconName: "sparkles.rectangle.stack.fill",
+                title: "その場で作成の利用",
+                description: "保存済みの意味をもとに、新しい例文と和訳をその場で作成するテストが使えます。"
+            )
+        }
+    }
+
+    private var premiumPurchaseCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            premiumPlanButton(
+                badge: "オススメ",
+                title: "年プラン",
+                trailingTop: "",
+                trailingBottom: subscriptionManager.yearlyPriceDisplay,
+                isPrimary: true
+            ) {
+                await subscriptionManager.purchasePremiumYearly()
+            }
+
+            premiumPlanButton(
+                badge: nil,
+                title: "月プラン",
+                trailingTop: "",
+                trailingBottom: subscriptionManager.monthlyPriceDisplay,
+                isPrimary: false
+            ) {
+                await subscriptionManager.purchasePremiumMonthly()
+            }
+
+            Text("登録が確定した時点でApple IDに請求されます。購読は自動更新され、現在の購読期間が終了する24時間前以内にアカウントへ次の請求が行われます。購入後の変更またはキャンセルは、App Storeのアカウントで行えます。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .lineSpacing(3)
+                .padding(.top, 6)
+
+            Button(subscriptionManager.isRestoring ? "復元中..." : "購入を復元") {
+                Task {
+                    await subscriptionManager.restorePurchases()
+                }
+            }
+            .buttonStyle(.plain)
+            .font(.body.weight(.medium))
+            .frame(maxWidth: .infinity)
+            .padding(.top, 16)
+            .disabled(subscriptionManager.isRestoring || subscriptionManager.isLoading)
+
+            VStack(spacing: 18) {
+                premiumLegalLink(title: "利用規約", path: "terms.html")
+                premiumLegalLink(title: "個人情報保護方針", path: "privacy.html")
+                premiumLegalLink(title: "お問い合わせ", path: "contact.html")
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.top, 8)
+
+            if let errorMessage = subscriptionManager.errorMessage,
+               errorMessage.contains("サブスク商品が見つかりません") == false {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func premiumPlanButton(
+        badge: String?,
+        title: String,
+        trailingTop: String,
+        trailingBottom: String,
+        isPrimary: Bool,
+        action: @escaping @MainActor () async -> Void
+    ) -> some View {
+        Button {
+            Task {
+                await action()
+            }
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let badge {
+                        Text(badge)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.blue)
+                    }
+
+                    Text(title)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(Color.blue)
+                }
+
+                Spacer(minLength: 0)
+
+                VStack(alignment: .trailing, spacing: 6) {
+                    if trailingTop.isEmpty == false {
+                        Text(trailingTop)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.blue.opacity(0.7))
+                    }
+
+                    Text(trailingBottom)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(Color.blue)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(uiColor: .systemBackground))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.blue.opacity(isPrimary ? 0.95 : 0.7), lineWidth: 1.4)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(subscriptionManager.isPurchasing || subscriptionManager.isLoading || subscriptionManager.hasPremiumAccess)
+    }
+
+    @ViewBuilder
+    private func premiumLegalLink(title: String, path: String) -> some View {
+        let url = legalPageURL(path: path)
+
+#if os(iOS)
+        Button(title) {
+            selectedLegalPage = LegalPage(title: title, url: url)
+        }
+        .buttonStyle(.plain)
+        .font(.body.weight(.medium))
+        .foregroundStyle(.primary)
+#else
+        Button(title) {
+            openURL(url)
+        }
+        .buttonStyle(.plain)
+        .font(.body.weight(.medium))
+        .foregroundStyle(.primary)
+#endif
+    }
+
+    private func premiumFeatureRow(iconName: String, title: String, description: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: iconName)
+                .font(.title3)
+                .foregroundStyle(Color.orange)
+                .frame(width: 24, height: 24)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.body.weight(.semibold))
+                Text(description)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
 
     private func generatedSection(draft: WordEntryDraft, visibleSenses: [WordSense]) -> some View {
         let isSaved = hasSavedEntry(for: draft.word)
@@ -687,6 +1305,26 @@ struct ContentView: View {
         }
     }
 
+    private var partitionedEntries: (words: [WordEntry], phrases: [WordEntry], normalizedWords: Set<String>) {
+        entries.reduce(into: (words: [WordEntry](), phrases: [WordEntry](), normalizedWords: Set<String>())) { partialResult, entry in
+            switch entryKind(for: entry.word, senses: entry.senses) {
+            case .word:
+                partialResult.words.append(entry)
+            case .phrase:
+                partialResult.phrases.append(entry)
+            }
+
+            let normalizedWord = normalizedEntryText(entry.word)
+            if normalizedWord.isEmpty == false {
+                partialResult.normalizedWords.insert(normalizedWord)
+            }
+        }
+    }
+
+    private var filteredListEntries: [WordEntry] {
+        selectedListCategory == .word ? partitionedEntries.words : partitionedEntries.phrases
+    }
+
     private var nextEntryNumberText: String {
         "\(entries.count + 1)"
     }
@@ -705,20 +1343,109 @@ struct ContentView: View {
         )
     }
 
+    private var filteredTestEntries: [WordEntry] {
+        selectedTestFilter == .word ? partitionedEntries.words : partitionedEntries.phrases
+    }
+
+    private var selectedTestEntries: [WordEntry] {
+        guard filteredTestEntries.isEmpty == false else {
+            return []
+        }
+
+        let lowerBound = min(max(testRangeStart, 1), filteredTestEntries.count) - 1
+        let upperBound = min(max(testRangeEnd, testRangeStart), filteredTestEntries.count) - 1
+        guard lowerBound <= upperBound else {
+            return []
+        }
+
+        return Array(filteredTestEntries[lowerBound...upperBound])
+    }
+
+    private var effectiveQuestionCount: Int {
+        let availableCount = availableQuestionSourceCount
+        guard availableCount > 0 else {
+            return 0
+        }
+
+        if subscriptionManager.hasPremiumAccess {
+            return min(premiumTestQuestionCount, availableCount)
+        }
+
+        return min(10, availableCount)
+    }
+
+    private var canStartAITest: Bool {
+        guard availableQuestionSourceCount > 0 else {
+            return false
+        }
+
+        if subscriptionManager.hasPremiumAccess {
+            return true
+        }
+
+        guard aiTestQuotaManager.remainingTests > 0 else {
+            return false
+        }
+
+        return availableSelectedEntryCount >= 10
+    }
+
+    private var freeTestRangeRequirementMessage: String {
+        switch selectedTestFilter {
+        case .word:
+            return "英単語を10個以上選んでください。"
+        case .phrase:
+            return "英熟語を10個以上選んでください。"
+        }
+    }
+
+    private var premiumQuestionCountBinding: Binding<Int> {
+        Binding(
+            get: { premiumTestQuestionCount },
+            set: { newValue in
+                let upperBound = max(availableQuestionSourceCount, 1)
+                premiumTestQuestionCount = min(max(newValue, 1), upperBound)
+            }
+        )
+    }
+
     private var availabilityMessage: String {
         WordEntryGeneratorFactory.availabilityMessage
     }
 
+    private var availableEntriesForCurrentTestSettings: [WordEntry] {
+        selectedTestEntries
+    }
+
+    private var availableSelectedEntryCount: Int {
+        availableEntriesForCurrentTestSettings.count
+    }
+
+    private var availableQuestionSourceCount: Int {
+        selectionQuestionSources(
+            from: availableEntriesForCurrentTestSettings,
+            primaryOnly: testUsesPrimaryMeaningOnly
+        ).count
+    }
+
+    private var shouldGenerateAITestExamplesOnTheFly: Bool {
+        subscriptionManager.hasPremiumAccess && testGeneratesExamplesOnTheFly
+    }
+
+    private var shouldShowBannerAd: Bool {
+        #if targetEnvironment(simulator)
+        return false
+        #else
+        subscriptionManager.hasPremiumAccess == false
+        #endif
+    }
+
     private var wordEntryCount: Int {
-        entries.filter { entry in
-            entryKind(for: entry.word, senses: entry.senses) == .word
-        }.count
+        partitionedEntries.words.count
     }
 
     private var phraseEntryCount: Int {
-        entries.filter { entry in
-            entryKind(for: entry.word, senses: entry.senses) == .phrase
-        }.count
+        partitionedEntries.phrases.count
     }
 
     private var remainingCreationCountText: String {
@@ -752,6 +1479,11 @@ struct ContentView: View {
 
     @MainActor
     private func generateWordEntry() async {
+        guard inputWord.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            errorMessage = nil
+            return
+        }
+
         let canGenerate = subscriptionManager.hasPremiumAccess || usageQuotaManager.remainingCreations > 0
         guard canGenerate else {
             errorMessage = "無料作成回数を使い切りました。広告を視聴すると作成回数が3回追加されます。"
@@ -784,13 +1516,14 @@ struct ContentView: View {
 
     private func saveDraft(_ draft: WordEntryDraft, visibleSenses: [WordSense]) {
         withAnimation {
-            let primarySense = visibleSenses.first ?? draft.primarySense
+            let normalizedSenses = normalizeSensesForStorage(visibleSenses)
+            let primarySense = normalizedSenses.first ?? draft.primarySense
             let entry = WordEntry(
                 word: draft.word,
                 meaningJapanese: primarySense.meaningJapanese,
                 exampleSentence: primarySense.exampleSentence,
                 exampleTranslation: primarySense.exampleTranslation,
-                senses: visibleSenses,
+                senses: normalizedSenses,
                 contextualMeanings: visibleContextualMeanings(for: draft),
                 generatedBy: draft.generatedBy
             )
@@ -802,15 +1535,387 @@ struct ContentView: View {
         }
     }
 
+    @MainActor
+    private func startAITest() async {
+        syncTestRangeSelection(resetToFullRange: false)
+
+        let availableEntries = availableEntriesForCurrentTestSettings
+
+        guard availableEntries.isEmpty == false else {
+            testMessage = "出題できる保存データがありません。"
+            activeTestSession = nil
+            return
+        }
+
+        guard subscriptionManager.hasPremiumAccess || availableSelectedEntryCount >= 10 else {
+            testMessage = freeTestRangeRequirementMessage
+            activeTestSession = nil
+            return
+        }
+
+        if subscriptionManager.hasPremiumAccess == false, aiTestQuotaManager.remainingTests <= 0 {
+            testMessage = "無料テスト回数を使い切りました。広告を視聴するとテスト回数が2回追加されます。"
+            activeTestSession = nil
+            return
+        }
+
+        isPreparingTest = true
+        defer { isPreparingTest = false }
+
+        do {
+            let questions = try await buildAITestQuestions(
+                from: availableEntries,
+                questionCount: effectiveQuestionCount
+            )
+
+            guard questions.isEmpty == false else {
+                testMessage = "問題を作るための候補が足りません。出題範囲を広げてください。"
+                activeTestSession = nil
+                return
+            }
+
+            activeTestSession = AITestSession(
+                questions: questions,
+                usesPrimaryMeaningOnly: testUsesPrimaryMeaningOnly
+            )
+            testMessage = nil
+            if subscriptionManager.hasPremiumAccess == false {
+                aiTestQuotaManager.consumeTest()
+            }
+        } catch {
+            activeTestSession = nil
+            testMessage = error.localizedDescription
+        }
+    }
+
+    private func buildAITestQuestions(from sourceEntries: [WordEntry], questionCount: Int) async throws -> [AITestQuestion] {
+        if shouldGenerateAITestExamplesOnTheFly {
+            return try await buildGeneratedAITestQuestions(from: sourceEntries, questionCount: questionCount)
+        }
+
+        return buildSelectionQuestions(from: sourceEntries, questionCount: questionCount)
+    }
+
+    private func buildSelectionQuestions(from sourceEntries: [WordEntry], questionCount: Int) -> [AITestQuestion] {
+        let questionSources = selectionQuestionSources(
+            from: sourceEntries,
+            primaryOnly: testUsesPrimaryMeaningOnly
+        )
+        let desiredCount = min(questionCount, questionSources.count)
+        guard desiredCount > 0 else {
+            return []
+        }
+
+        let selectedSources = Array(questionSources.shuffled().prefix(desiredCount))
+
+        return selectedSources.compactMap { source in
+            let meaningJapanese = source.sense.meaningJapanese.trimmingCharacters(in: .whitespacesAndNewlines)
+            let exampleSentence = source.sense.exampleSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+            let exampleTranslation = source.sense.exampleTranslation.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard meaningJapanese.isEmpty == false, exampleSentence.isEmpty == false else {
+                return nil
+            }
+
+            return AITestQuestion(
+                term: source.entry.word,
+                termLabel: source.promptSubtitle,
+                meaningJapanese: meaningJapanese,
+                exampleSentence: exampleSentence,
+                exampleTranslation: exampleTranslation
+            )
+        }
+    }
+
+    private func buildGeneratedAITestQuestions(from sourceEntries: [WordEntry], questionCount: Int) async throws -> [AITestQuestion] {
+        let questionSources = selectionQuestionSources(
+            from: sourceEntries,
+            primaryOnly: testUsesPrimaryMeaningOnly
+        )
+        let desiredCount = min(questionCount, questionSources.count)
+        guard desiredCount > 0 else {
+            return []
+        }
+
+        let selectedSources = Array(questionSources.shuffled().prefix(desiredCount))
+        let promptInputs = selectedSources.map { source in
+            AITestPromptInput(
+                word: source.entry.word,
+                meaningJapanese: source.sense.meaningJapanese.trimmingCharacters(in: .whitespacesAndNewlines),
+                partOfSpeech: source.sense.partOfSpeech.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+
+        let generatedPrompts = try await aiTestGenerator.generateOriginalInputQuestions(from: promptInputs)
+
+        return zip(selectedSources, generatedPrompts).compactMap { source, generatedPrompt in
+            let meaningJapanese = generatedPrompt.meaningJapanese.trimmingCharacters(in: .whitespacesAndNewlines)
+            let exampleSentence = generatedPrompt.exampleSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+            let exampleTranslation = generatedPrompt.exampleTranslation.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard meaningJapanese.isEmpty == false, exampleSentence.isEmpty == false else {
+                return nil
+            }
+
+            return AITestQuestion(
+                term: source.entry.word,
+                termLabel: source.promptSubtitle,
+                meaningJapanese: meaningJapanese,
+                exampleSentence: exampleSentence,
+                exampleTranslation: exampleTranslation
+            )
+        }
+    }
+
+    private func selectionQuestionSources(from sourceEntries: [WordEntry], primaryOnly: Bool) -> [AITestQuestionSource] {
+        sourceEntries.reduce(into: [AITestQuestionSource]()) { result, entry in
+            let senses: [WordSense] = primaryOnly ? Array(entry.senses.prefix(1)) : entry.senses
+
+            for sense in senses {
+                let meaning = sense.meaningJapanese.trimmingCharacters(in: .whitespacesAndNewlines)
+                let exampleSentence = sense.exampleSentence.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                guard meaning.isEmpty == false, exampleSentence.isEmpty == false else {
+                    continue
+                }
+
+                result.append(
+                    AITestQuestionSource(
+                        entry: entry,
+                        sense: sense,
+                        promptSubtitle: termLabel(for: entry.word, senses: entry.senses)
+                    )
+                )
+            }
+        }
+    }
+
+    private func revealTestCard() {
+        guard var session = activeTestSession else {
+            return
+        }
+
+        session.revealCurrentCard()
+        activeTestSession = session
+    }
+
+    private func moveToNextTestQuestion() {
+        guard var session = activeTestSession else {
+            return
+        }
+
+        session.advance()
+        activeTestSession = session
+    }
+
+    private func syncTestRangeSelection(resetToFullRange: Bool) {
+        let entryCount = filteredTestEntries.count
+
+        guard entryCount > 0 else {
+            testRangeStart = 1
+            testRangeEnd = 1
+            premiumTestQuestionCount = 10
+            return
+        }
+
+        if resetToFullRange {
+            testRangeStart = 1
+            testRangeEnd = entryCount
+        } else {
+            testRangeStart = min(max(testRangeStart, 1), entryCount)
+            testRangeEnd = min(max(testRangeEnd, testRangeStart), entryCount)
+        }
+
+        clampPremiumQuestionCount()
+    }
+
+    private func clampPremiumQuestionCount() {
+        let maxQuestionCount = max(availableQuestionSourceCount, 1)
+        premiumTestQuestionCount = min(max(premiumTestQuestionCount, 1), maxQuestionCount)
+    }
+
+    private func adjustTestRangeStart(by delta: Int) {
+        let maxStart = max(testRangeEnd - 1, 1)
+        testRangeStart = min(max(testRangeStart + delta, 1), maxStart)
+        clampPremiumQuestionCount()
+    }
+
+    private func adjustTestRangeEnd(by delta: Int) {
+        let maxEnd = max(filteredTestEntries.count, 1)
+        let minEnd = min(testRangeStart + 1, maxEnd)
+        testRangeEnd = min(max(testRangeEnd + delta, minEnd), maxEnd)
+        clampPremiumQuestionCount()
+    }
+
+    private func testRangeEntryTitle(for index: Int) -> String {
+        guard filteredTestEntries.indices.contains(max(index - 1, 0)) else {
+            return ""
+        }
+
+        return filteredTestEntries[index - 1].word
+    }
+
+    @ViewBuilder
+    private func testSessionSection(_ session: AITestSession) -> some View {
+        Section(session.isCompleted ? "完了" : "テスト") {
+            if session.isCompleted {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("\(session.questions.count)枚のカードを確認しました。")
+                        .font(.headline)
+                    Text(session.resultMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Button("もう一度同じ条件で出題") {
+                    Task {
+                        await startAITest()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            } else if let currentQuestion = session.currentQuestion {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
+                        Text(session.usesPrimaryMeaningOnly ? "主な意味のみ" : "複数の意味を含む")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(Color(uiColor: .tertiarySystemBackground))
+                            )
+
+                        Spacer(minLength: 0)
+                    }
+
+                    Text("\(session.currentQuestionNumber) / \(session.questions.count)")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        revealTestCard()
+                    } label: {
+                        flashCardView(
+                            question: currentQuestion,
+                            isRevealed: session.isAnswerRevealed
+                        )
+                    }
+                    .buttonStyle(.plain)
+
+                    Text(session.isAnswerRevealed ? "カードをタップすると表面に戻れます。" : "カードをタップして裏面を見ます。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+
+                Button(session.isLastQuestion ? "終了" : "次へ") {
+                    if session.isLastQuestion {
+                        activeTestSession = nil
+                    } else {
+                        moveToNextTestQuestion()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
+    private func flashCardView(question: AITestQuestion, isRevealed: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(isRevealed ? "裏面" : "表面")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Text(question.termLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            if isRevealed {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("意味")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(question.meaningJapanese)
+                            .font(.body.weight(.semibold))
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("日本語訳")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(question.exampleTranslation)
+                            .font(.body)
+                    }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("例文")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    highlightedTermText(
+                        sentence: question.exampleSentence,
+                        term: question.term
+                    )
+                        .font(.title3.weight(.medium))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(Color(uiColor: .separator).opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private func highlightedTermText(sentence: String, term: String) -> Text {
+        let trimmedSentence = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTerm = term.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard trimmedSentence.isEmpty == false else {
+            return Text("")
+        }
+
+        guard trimmedTerm.isEmpty == false else {
+            return Text(trimmedSentence)
+        }
+
+        let loweredSentence = trimmedSentence.lowercased()
+        let loweredTerm = trimmedTerm.lowercased()
+
+        guard
+            let loweredRange = loweredSentence.range(of: loweredTerm),
+            let start = String.Index(loweredRange.lowerBound, within: trimmedSentence),
+            let end = String.Index(loweredRange.upperBound, within: trimmedSentence)
+        else {
+            return Text(trimmedSentence)
+        }
+
+        let prefix = String(trimmedSentence[..<start])
+        let match = String(trimmedSentence[start..<end])
+        let suffix = String(trimmedSentence[end...])
+
+        return Text(prefix) + Text(match).foregroundStyle(.red) + Text(suffix)
+    }
+
     private func hasSavedEntry(for word: String) -> Bool {
         let normalizedWord = normalizedEntryText(word)
         guard normalizedWord.isEmpty == false else {
             return false
         }
 
-        return entries.contains { entry in
-            normalizedEntryText(entry.word) == normalizedWord
-        }
+        return partitionedEntries.normalizedWords.contains(normalizedWord)
     }
 
     private func normalizedEntryText(_ text: String) -> String {
@@ -833,26 +1938,41 @@ struct ContentView: View {
         }
     }
 
-    private func categorizedEntriesSection(kind: EntryKind) -> some View {
-        let filteredEntries = entries.enumerated().filter { _, entry in
-            entryKind(for: entry.word, senses: entry.senses) == kind
-        }
+    private var emptyStateTextColor: Color {
+        Color(red: 0.50, green: 0.50, blue: 0.54)
+    }
 
-        return Section {
+    private func categorizedEntriesSection(kind: EntryKind) -> some View {
+        let filteredEntries = kind == .word ? partitionedEntries.words : partitionedEntries.phrases
+
+        return Group {
             if filteredEntries.isEmpty {
-                Text(kind == .word ? "英単語はまだありません" : "熟語はまだありません")
+                Text(kind == .word ? "英単語はまだありません" : "英熟語はまだありません")
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(emptyStateTextColor)
             } else {
-                ForEach(filteredEntries, id: \.element.persistentModelID) { index, entry in
+                ForEach(Array(filteredEntries.enumerated()), id: \.element.persistentModelID) { visibleIndex, entry in
+
                     NavigationLink {
                         WordEntryDetailView(entry: entry)
                     } label: {
-                        entryRow(index: index, entry: entry)
+                        entryRow(index: visibleIndex, entry: entry)
+                    }
+
+                    if shouldShowBannerAd && shouldInsertBanner(afterVisibleIndex: visibleIndex, totalCount: filteredEntries.count) {
+                        NativeAdPlacement(topSpacing: 4, bottomSpacing: 4)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
                     }
                 }
                 .onDelete { offsets in
-                    let indexesToDelete = IndexSet(offsets.map { filteredEntries[$0].offset })
+                    let indexesToDelete = IndexSet(
+                        offsets.compactMap { filteredIndex in
+                            let entryID = filteredEntries[filteredIndex].persistentModelID
+                            return entries.firstIndex { $0.persistentModelID == entryID }
+                        }
+                    )
                     deleteEntries(offsets: indexesToDelete)
                 }
             }
@@ -874,6 +1994,29 @@ struct ContentView: View {
         .padding(.vertical, 4)
     }
 
+    private func listEmptyStateCard(message: String) -> some View {
+        Text(message)
+            .font(.footnote)
+            .foregroundStyle(emptyStateTextColor)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 18)
+            .background(Color.white)
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+    }
+
+    private func shouldInsertBanner(afterVisibleIndex visibleIndex: Int, totalCount: Int) -> Bool {
+        guard totalCount > 1 else {
+            return false
+        }
+
+        if totalCount <= 4 {
+            return visibleIndex == 0
+        }
+
+        return visibleIndex > 0 && (visibleIndex + 1).isMultiple(of: 4)
+    }
+
     private var searchResults: [(offset: Int, entry: WordEntry)] {
         let normalizedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard normalizedQuery.isEmpty == false else {
@@ -881,10 +2024,28 @@ struct ContentView: View {
         }
 
         return entries.enumerated().compactMap { index, entry in
-            guard entrySearchText(for: entry).contains(normalizedQuery) else {
+            guard entryMatchesSearchQuery(entry, query: normalizedQuery) else {
                 return nil
             }
             return (offset: index, entry: entry)
+        }
+    }
+
+    private func entryMatchesSearchQuery(_ entry: WordEntry, query: String) -> Bool {
+        let normalizedWord = entry.word
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if queryUsesLatinPrefixMatching(query) {
+            return normalizedWord.hasPrefix(query)
+        }
+
+        return entrySearchText(for: entry).contains(query)
+    }
+
+    private func queryUsesLatinPrefixMatching(_ query: String) -> Bool {
+        query.unicodeScalars.allSatisfy { scalar in
+            CharacterSet.alphanumerics.contains(scalar) || scalar == " " || scalar == "-" || scalar == "'"
         }
     }
 
@@ -898,9 +2059,6 @@ struct ContentView: View {
             } label: {
                 entryRow(index: index, entry: entry)
             }
-            .simultaneousGesture(TapGesture().onEnded {
-                dismissKeyboard()
-            })
         }
     }
 
@@ -1040,7 +2198,7 @@ struct ContentView: View {
         case "auxiliary verb":
             return "助動詞"
         case "phrase":
-            return "熟語"
+            return "英熟語"
         case "idiom":
             return "慣用句"
         case "phrasal verb":
@@ -1059,9 +2217,9 @@ struct ContentView: View {
     private func saveButtonTitle(for draft: WordEntryDraft) -> String {
         switch entryKind(for: draft.word, senses: draft.senses) {
         case .word:
-            return "単語を保存"
+            return "英単語を保存"
         case .phrase:
-            return "熟語を保存"
+            return "英熟語を保存"
         }
     }
 
@@ -1087,6 +2245,7 @@ struct ContentView: View {
         }
 
         usageQuotaManager.setPreviewRemainingCreations(5)
+        aiTestQuotaManager.setPreviewRemainingTests(3)
         hasSeededPreviewQuota = true
     }
 
@@ -1174,19 +2333,14 @@ private struct KeyboardDismissOnTapView: UIViewRepresentable {
             _ gestureRecognizer: UIGestureRecognizer,
             shouldReceive touch: UITouch
         ) -> Bool {
-            guard let touchedView = touch.view else {
-                return true
-            }
+            touch.view === gestureRecognizer.view
+        }
 
-            var currentView: UIView? = touchedView
-            while let view = currentView {
-                if view is UIControl || view is UITextField || view is UITextView {
-                    return false
-                }
-                currentView = view.superview
-            }
-
-            return true
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            true
         }
     }
 }
@@ -1197,6 +2351,85 @@ private enum AppTab {
     case search
     case list
     case test
+}
+
+private enum TestEntryFilter: String, CaseIterable, Identifiable {
+    case word
+    case phrase
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .word:
+            return "英単語"
+        case .phrase:
+            return "英熟語"
+        }
+    }
+}
+
+private struct AITestQuestionSource: Identifiable {
+    let entry: WordEntry
+    let sense: WordSense
+    let promptSubtitle: String
+
+    var id: String {
+        "\(entry.persistentModelID)-\(sense.id)"
+    }
+}
+
+private struct AITestQuestion: Identifiable {
+    let id = UUID()
+    let term: String
+    let termLabel: String
+    let meaningJapanese: String
+    let exampleSentence: String
+    let exampleTranslation: String
+}
+
+private struct AITestSession {
+    let questions: [AITestQuestion]
+    let usesPrimaryMeaningOnly: Bool
+    var currentIndex = 0
+    var isAnswerRevealed = false
+
+    var currentQuestion: AITestQuestion? {
+        guard isCompleted == false, questions.indices.contains(currentIndex) else {
+            return nil
+        }
+
+        return questions[currentIndex]
+    }
+
+    var currentQuestionNumber: Int {
+        min(currentIndex + 1, questions.count)
+    }
+
+    var isLastQuestion: Bool {
+        currentIndex == questions.count - 1
+    }
+
+    var isCompleted: Bool {
+        currentIndex >= questions.count
+    }
+
+    var resultMessage: String {
+        "例文と意味をセットで見直せたので、そのままもう一度流すと覚えやすいです。"
+    }
+
+    mutating func revealCurrentCard() {
+        guard isCompleted == false else {
+            return
+        }
+
+        isAnswerRevealed.toggle()
+    }
+
+    mutating func advance() {
+        currentIndex += 1
+        isAnswerRevealed = false
+    }
 }
 
 private let appVersionText: String = {
@@ -1218,26 +2451,106 @@ private let appLegalBaseURL: URL = {
         return configuredURL
     }
 
-    return URL(string: "https://ryuseiokada.github.io/english-word-app/")!
+    return URL(string: "https://seitoro.github.io/english-word-app/")!
 }()
-
-private func settingsValueRow(title: String, value: String) -> some View {
-    HStack {
-        Text(title)
-        Spacer()
-        Text(value)
-            .foregroundStyle(.secondary)
-    }
-}
 
 private func settingsRowLabel(title: String) -> some View {
     HStack {
         Text(title)
             .foregroundStyle(.primary)
         Spacer()
-        Image(systemName: "arrow.up.right.square")
+        Image(systemName: "chevron.right")
+            .font(.footnote.weight(.semibold))
             .foregroundStyle(.secondary)
     }
+    .contentShape(Rectangle())
+}
+
+private func settingsActionRow(title: String, systemImage: String) -> some View {
+    HStack(spacing: 12) {
+        premiumSparklesIcon(size: 28, iconSize: 14, cornerRadius: 10)
+
+        Text(title)
+            .foregroundStyle(.primary)
+
+        Spacer()
+
+        Image(systemName: "chevron.right")
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.secondary)
+    }
+    .contentShape(Rectangle())
+}
+
+private func premiumSparklesIcon(size: CGFloat, iconSize: CGFloat, cornerRadius: CGFloat) -> some View {
+    ZStack {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .fill(
+                LinearGradient(
+                    colors: [
+                        Color(red: 1.00, green: 0.84, blue: 0.35),
+                        Color(red: 0.98, green: 0.70, blue: 0.18),
+                        Color(red: 0.94, green: 0.54, blue: 0.05)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.38),
+                                Color.white.opacity(0.10),
+                                Color.clear
+                            ],
+                            startPoint: .top,
+                            endPoint: .center
+                        )
+                    )
+                    .clipShape(
+                        UnevenRoundedRectangle(
+                            topLeadingRadius: cornerRadius,
+                            bottomLeadingRadius: 6,
+                            bottomTrailingRadius: 6,
+                            topTrailingRadius: cornerRadius
+                        )
+                    )
+                    .scaleEffect(x: 0.92, y: 0.52, anchor: .top)
+                    .offset(y: 1)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(Color.white.opacity(0.2), lineWidth: 0.8)
+            }
+            .shadow(color: Color(red: 0.95, green: 0.62, blue: 0.10).opacity(0.22), radius: 6, y: 2)
+
+        Image(systemName: "gift.fill")
+            .font(.system(size: iconSize, weight: .semibold))
+            .foregroundStyle(.white)
+            .shadow(color: .white.opacity(0.55), radius: 3)
+            .shadow(color: Color(red: 1.00, green: 0.97, blue: 0.78).opacity(0.45), radius: 8)
+    }
+    .frame(width: size, height: size)
+}
+
+private func settingsSelectionRow(title: String, isSelected: Bool) -> some View {
+    HStack {
+        Text(title)
+            .foregroundStyle(.primary)
+
+        Spacer()
+
+        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(
+                isSelected
+                ? Color(red: 0.95, green: 0.58, blue: 0.08)
+                : Color.secondary.opacity(0.7)
+            )
+    }
+    .contentShape(Rectangle())
 }
 
 private struct LegalPage: Identifiable {
@@ -1266,7 +2579,7 @@ private struct WordEntryDetailView: View {
 
     var body: some View {
         List {
-            Section("単語情報") {
+            Section("英単語情報") {
                 detailRow(title: termLabel(for: entry.word, senses: entry.senses), text: entry.word)
             }
 
@@ -1318,7 +2631,7 @@ private struct WordEntryDetailView: View {
         case "auxiliary verb":
             return "助動詞"
         case "phrase":
-            return "熟語"
+            return "英熟語"
         case "idiom":
             return "慣用句"
         case "phrasal verb":
@@ -1345,19 +2658,28 @@ enum EntryKind: Hashable {
         case .word:
             return "英単語"
         case .phrase:
-            return "熟語"
+            return "英熟語"
         }
     }
 }
 
 func entryKind(for word: String, senses: [WordSense]) -> EntryKind {
-    let normalizedWord = word.trimmingCharacters(in: .whitespacesAndNewlines)
-    if normalizedWord.contains(where: \.isWhitespace) {
+    let normalizedWord = word
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+
+    if normalizedWord.split(whereSeparator: \.isWhitespace).count > 1 {
         return .phrase
     }
 
-    let phrasePartsOfSpeech = Set(["phrase", "idiom", "phrasal verb", "expression"])
-    if senses.contains(where: { phrasePartsOfSpeech.contains($0.partOfSpeech.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }) {
+    let phrasePartOfSpeechKeywords = ["phrase", "idiom", "phrasal verb", "expression"]
+    if senses.contains(where: { sense in
+        let normalizedPartOfSpeech = sense.partOfSpeech
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        return phrasePartOfSpeechKeywords.contains(where: { normalizedPartOfSpeech.contains($0) })
+    }) {
         return .phrase
     }
 

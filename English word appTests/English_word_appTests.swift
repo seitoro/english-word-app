@@ -49,6 +49,10 @@ struct English_word_appTests {
         #expect(entryKind(for: "look after", senses: []) == .phrase)
     }
 
+    @Test func entryKindTreatsCollapsedWhitespaceInputAsPhrase() {
+        #expect(entryKind(for: "get   away", senses: []) == .phrase)
+    }
+
     @Test func entryKindTreatsPhrasePartOfSpeechAsPhrase() {
         let senses = [
             WordSense(
@@ -60,6 +64,48 @@ struct English_word_appTests {
         ]
 
         #expect(entryKind(for: "look", senses: senses) == .phrase)
+    }
+
+    @Test func entryKindTreatsCompositePhrasePartOfSpeechAsPhrase() {
+        let senses = [
+            WordSense(
+                partOfSpeech: "common phrasal verb",
+                meaningJapanese: "逃げる",
+                exampleSentence: "The thief got away.",
+                exampleTranslation: "泥棒は逃げました。"
+            )
+        ]
+
+        #expect(entryKind(for: "get", senses: senses) == .phrase)
+    }
+
+    @Test func normalizeSensesForStorageKeepsFirstSenseAndRemovesDuplicates() {
+        let senses = [
+            WordSense(
+                partOfSpeech: "verb",
+                meaningJapanese: "走る",
+                exampleSentence: "She runs every morning.",
+                exampleTranslation: "彼女は毎朝走ります。"
+            ),
+            WordSense(
+                partOfSpeech: "verb",
+                meaningJapanese: "走る",
+                exampleSentence: "She runs every morning.",
+                exampleTranslation: "彼女は毎朝走ります。"
+            ),
+            WordSense(
+                partOfSpeech: "noun",
+                meaningJapanese: "経営",
+                exampleSentence: "He manages the daily run of the store.",
+                exampleTranslation: "彼は店の日々の運営を担当しています。"
+            )
+        ]
+
+        let normalized = normalizeSensesForStorage(senses)
+
+        #expect(normalized.count == 2)
+        #expect(normalized.first?.meaningJapanese == "走る")
+        #expect(normalized.last?.meaningJapanese == "経営")
     }
 
 }

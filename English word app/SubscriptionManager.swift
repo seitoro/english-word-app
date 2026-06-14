@@ -16,6 +16,8 @@ import StoreKit
 final class SubscriptionManager: ObservableObject {
     @Published private(set) var hasPremiumAccess = false
     @Published private(set) var premiumProductDisplayName = "プレミアム"
+    @Published private(set) var monthlyPriceDisplay = "月額 1080円"
+    @Published private(set) var yearlyPriceDisplay = "年額 9800円"
     @Published private(set) var isLoading = false
     @Published private(set) var isPurchasing = false
     @Published private(set) var isRestoring = false
@@ -23,15 +25,28 @@ final class SubscriptionManager: ObservableObject {
     @Published private(set) var isSimulationEnabled = false
 
 #if canImport(StoreKit)
-    private var premiumProduct: Product?
+    private var premiumProductsByID: [String: Product] = [:]
+    private var transactionUpdatesTask: Task<Void, Never>?
 #endif
-
-    private let productID: String
+    
+    private let monthlyProductID: String
+    private let yearlyProductID: String
     private let simulationStore = SubscriptionSimulationStore()
+    
+    init(monthlyProductID: String? = nil, yearlyProductID: String? = nil) {
+        let configuration = SubscriptionConfiguration.load()
+        self.monthlyProductID = monthlyProductID ?? configuration.monthlyProductID
+        self.yearlyProductID = yearlyProductID ?? configuration.yearlyProductID
 
-    init(productID: String? = nil) {
-        let resolvedProductID = productID ?? SubscriptionConfiguration.load().premiumProductID
-        self.productID = resolvedProductID
+#if canImport(StoreKit)
+        self.transactionUpdatesTask = observeTransactionUpdates()
+#endif
+    }
+
+    deinit {
+#if canImport(StoreKit)
+        transactionUpdatesTask?.cancel()
+#endif
     }
 
     func prepare() async {
@@ -42,6 +57,8 @@ final class SubscriptionManager: ObservableObject {
         isSimulationEnabled = simulationStore.isEnabled
         if isSimulationEnabled {
             hasPremiumAccess = simulationStore.hasPremiumAccess
+            monthlyPriceDisplay = "月額 1080円"
+            yearlyPriceDisplay = "年額 9800円"
             errorMessage = nil
             return
         }
@@ -50,21 +67,43 @@ final class SubscriptionManager: ObservableObject {
         await refreshEntitlements()
 
         do {
-            let products = try await Product.products(for: [productID])
-            premiumProduct = products.first
-            if let premiumProduct {
-                premiumProductDisplayName = premiumProduct.displayName
+            let products = try await Product.products(for: [monthlyProductID, yearlyProductID])
+            premiumProductsByID = Dictionary(uniqueKeysWithValues: products.map { ($0.id, $0) })
+            guard premiumProductsByID.isEmpty == false else {
+                errorMessage = "サブスク商品が見つかりませんでした。App Store Connectの商品ID設定を確認してください。"
+                return
+            }
+            if let monthlyProduct = premiumProductsByID[monthlyProductID] {
+                premiumProductDisplayName = monthlyProduct.displayName
+                monthlyPriceDisplay = monthlyProduct.displayPrice
+            }
+            if let yearlyProduct = premiumProductsByID[yearlyProductID] {
+                yearlyPriceDisplay = yearlyProduct.displayPrice
             }
             errorMessage = nil
         } catch {
             errorMessage = "サブスク情報を読み込めませんでした。"
         }
 #else
+        monthlyPriceDisplay = "月額 1080円"
+        yearlyPriceDisplay = "年額 9800円"
         errorMessage = nil
 #endif
     }
 
+    func purchasePremiumMonthly() async {
+        await purchasePremium(productID: monthlyProductID)
+    }
+
+    func purchasePremiumYearly() async {
+        await purchasePremium(productID: yearlyProductID)
+    }
+
     func purchasePremium() async {
+        await purchasePremiumMonthly()
+    }
+
+    private func purchasePremium(productID: String) async {
         guard isPurchasing == false else { return }
 
         if isSimulationEnabled {
@@ -75,11 +114,11 @@ final class SubscriptionManager: ObservableObject {
         }
 
 #if canImport(StoreKit)
-        if premiumProduct == nil {
+        if premiumProductsByID.isEmpty {
             await prepare()
         }
 
-        guard let premiumProduct else {
+        guard let premiumProduct = premiumProductsByID[productID] else {
             errorMessage = "サブスク商品が見つかりませんでした。"
             return
         }
@@ -140,8 +179,8 @@ final class SubscriptionManager: ObservableObject {
         }
 
         return hasPremiumAccess
-            ? "広告なし、作成無制限、音声、AI自動テストが使えます。"
-            : "初回5回まで無料。以降は広告視聴で3回ずつ追加できます。プレミアムは月額1,280円です。"
+            ? "広告なし、AI自動テスト無制限、選んだ範囲から好きな問題数で出題できます。"
+            : "無料版でもAI自動テストは何度でも使えます。Premiumでは広告なしで、選んだ範囲から好きな問題数で出題できます。"
     }
 
     func disablePremiumSimulation() {
@@ -156,7 +195,7 @@ final class SubscriptionManager: ObservableObject {
         do {
             for await result in Transaction.currentEntitlements {
                 let transaction = try checkVerified(result)
-                if transaction.productID == productID {
+                if [monthlyProductID, yearlyProductID].contains(transaction.productID) {
                     hasPremiumAccess = true
                     errorMessage = nil
                     return
@@ -168,18 +207,43 @@ final class SubscriptionManager: ObservableObject {
         }
 #endif
     }
+
+#if canImport(StoreKit)
+    private func observeTransactionUpdates() -> Task<Void, Never> {
+        Task { [weak self] in
+            for await result in Transaction.updates {
+                guard let self else { return }
+
+                do {
+                    let transaction = try checkVerified(result)
+                    await self.refreshEntitlements()
+                    await transaction.finish()
+                } catch {
+                    continue
+                }
+            }
+        }
+    }
+#endif
 }
 
 struct SubscriptionConfiguration {
-    let premiumProductID: String
+    let monthlyProductID: String
+    let yearlyProductID: String
 
     static func load(bundle: Bundle = .main) -> SubscriptionConfiguration {
         let environment = ProcessInfo.processInfo.environment
-        let premiumProductID = environment["PREMIUM_PRODUCT_ID"]
-            ?? bundle.object(forInfoDictionaryKey: "PREMIUM_PRODUCT_ID") as? String
-            ?? "com.ryuseiokada.englishwordapp.multisense"
+        let monthlyProductID = environment["PREMIUM_MONTHLY_PRODUCT_ID"]
+            ?? bundle.object(forInfoDictionaryKey: "PREMIUM_MONTHLY_PRODUCT_ID") as? String
+            ?? "com.ryuseiokada.englishwordapp.premium.monthly1080"
+        let yearlyProductID = environment["PREMIUM_YEARLY_PRODUCT_ID"]
+            ?? bundle.object(forInfoDictionaryKey: "PREMIUM_YEARLY_PRODUCT_ID") as? String
+            ?? "com.ryuseiokada.englishwordapp.premium.yearly9800"
 
-        return SubscriptionConfiguration(premiumProductID: premiumProductID)
+        return SubscriptionConfiguration(
+            monthlyProductID: monthlyProductID,
+            yearlyProductID: yearlyProductID
+        )
     }
 }
 

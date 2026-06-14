@@ -40,6 +40,15 @@ struct AppleIntelligenceWordEntryGenerator: WordEntryGenerating {
         return .unknown
     }
 
+    var isPotentiallyAvailable: Bool {
+#if canImport(FoundationModels)
+        if #available(iOS 26.0, macOS 26.0, *) {
+            return true
+        }
+#endif
+        return false
+    }
+
     func generateDraft(from input: String) async throws -> WordEntryDraft {
         let normalized = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized.isEmpty == false else {
@@ -56,6 +65,7 @@ struct AppleIntelligenceWordEntryGenerator: WordEntryGenerating {
                 - multiple common meanings when the word is polysemous
                 - one simple English example sentence for each meaning
                 - a natural Japanese translation of each sentence
+                Put the most common and representative learner meaning first.
                 Keep the output suitable for middle school and high school learners.
                 """
             )
@@ -65,6 +75,7 @@ struct AppleIntelligenceWordEntryGenerator: WordEntryGenerating {
                 Create a vocabulary notebook entry for this English word: \(normalized)
                 Keep the word exactly as entered.
                 Include up to 6 useful senses.
+                Order the senses from the most representative meaning to less common ones.
                 """,
                 generating: AppleIntelligenceWordEntry.self
             )
@@ -72,14 +83,14 @@ struct AppleIntelligenceWordEntryGenerator: WordEntryGenerating {
             let content = response.content
             return WordEntryDraft(
                 word: content.word.trimmingCharacters(in: .whitespacesAndNewlines),
-                senses: content.senses.map {
+                senses: normalizeSensesForStorage(content.senses.map {
                     WordSense(
                         partOfSpeech: $0.partOfSpeech.trimmingCharacters(in: .whitespacesAndNewlines),
                         meaningJapanese: $0.meaningJapanese.trimmingCharacters(in: .whitespacesAndNewlines),
                         exampleSentence: $0.exampleSentence.trimmingCharacters(in: .whitespacesAndNewlines),
                         exampleTranslation: $0.exampleTranslation.trimmingCharacters(in: .whitespacesAndNewlines)
                     )
-                },
+                }),
                 contextualMeanings: [],
                 generatedBy: "Apple Intelligence"
             )

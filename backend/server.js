@@ -41,12 +41,16 @@ app.post("/v1/word-entry", async (request, response) => {
           "You create vocabulary notebook entries for Japanese learners.",
           "The target may be a single English word or a short English phrase/idiom.",
           "Return valid JSON only with these keys:",
-          "word, senses, contextualMeanings",
+          "word, exists, note, senses, contextualMeanings",
           "Keep word exactly equal to the input word.",
+          "exists must be true only when the input is a real, established English word, phrase, or idiom that learners would actually study.",
+          "If the input is misspelled, invented, or not an established English expression, set exists to false.",
+          "When exists is false, set note to a short Japanese explanation and return empty arrays for senses and contextualMeanings.",
           "senses must be an array of the common meanings of the word or phrase for learners.",
           "Each item in senses must have these keys:",
           "partOfSpeech, meaningJapanese, exampleSentence, exampleTranslation",
           "For phrases and idioms, include the representative meaning learners should memorize first.",
+          "Put the most common and representative learner meaning first in senses.",
           "Include as many common meanings as are useful, up to 6 senses.",
           "meaningJapanese should be short and natural.",
           "exampleSentence should be one simple English sentence using the word for that meaning.",
@@ -84,6 +88,8 @@ app.post("/v1/word-entry", async (request, response) => {
 
     return response.json({
       word: payload.word,
+      exists: payload.exists !== false,
+      note: typeof payload.note === "string" ? payload.note : "",
       senses: Array.isArray(payload.senses) ? payload.senses : [],
       contextualMeanings: Array.isArray(payload.contextualMeanings) ? payload.contextualMeanings : [],
       generatedBy: "OpenAI via Secure Backend"
@@ -91,6 +97,76 @@ app.post("/v1/word-entry", async (request, response) => {
   } catch (error) {
     return response.status(500).json({
       error: "Failed to generate word entry",
+      details: error instanceof Error ? error.message : "Unknown error"
+    });
+  }
+});
+
+app.post("/v1/ai-test-prompts", async (request, response) => {
+  try {
+    const items = Array.isArray(request.body?.items) ? request.body.items : [];
+    if (items.length === 0) {
+      return response.status(400).json({ error: "items are required" });
+    }
+
+    if (!openAIKey) {
+      return response.status(500).json({ error: "OPENAI_API_KEY is not configured" });
+    }
+
+    const normalizedItems = items
+      .map((item) => ({
+        word: String(item?.word || "").trim(),
+        meaningJapanese: String(item?.meaningJapanese || "").trim(),
+        partOfSpeech: String(item?.partOfSpeech || "").trim()
+      }))
+      .filter((item) => item.word && item.meaningJapanese);
+
+    if (normalizedItems.length === 0) {
+      return response.status(400).json({ error: "valid items are required" });
+    }
+
+    const openAIResponse = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${openAIKey}`
+      },
+      body: JSON.stringify({
+        model,
+        instructions: [
+          "You create original fill-in-the-blank vocabulary test prompts for Japanese learners.",
+          "Return valid JSON only with one top-level key: items.",
+          "items must be an array with the same number of elements and the same order as the input.",
+          "Each item must have these keys:",
+          "word, meaningJapanese, exampleSentence, exampleTranslation",
+          "Keep word exactly equal to the input word.",
+          "Keep meaningJapanese exactly equal to the input meaningJapanese.",
+          "exampleSentence must be a brand-new natural English sentence and must not quote the input.",
+          "exampleSentence must clearly use the target word or phrase exactly once.",
+          "exampleTranslation must be a natural Japanese translation of that sentence.",
+          "Keep sentences simple and suitable for middle school and high school learners.",
+          "Do not add any extra keys or commentary."
+        ].join("\n"),
+        input: JSON.stringify({ items: normalizedItems }),
+        reasoning: { effort: "low" }
+      })
+    });
+
+    if (!openAIResponse.ok) {
+      const errorText = await openAIResponse.text();
+      return response.status(502).json({ error: "OpenAI request failed", details: errorText });
+    }
+
+    const data = await openAIResponse.json();
+    const text = data.output_text || firstText(data.output);
+    const payload = extractJSONObject(text);
+
+    return response.json({
+      items: Array.isArray(payload.items) ? payload.items : []
+    });
+  } catch (error) {
+    return response.status(500).json({
+      error: "Failed to generate AI test prompts",
       details: error instanceof Error ? error.message : "Unknown error"
     });
   }

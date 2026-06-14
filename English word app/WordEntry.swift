@@ -24,6 +24,30 @@ struct WordSense: Codable, Equatable, Identifiable {
     }
 }
 
+func normalizeSensesForStorage(_ senses: [WordSense]) -> [WordSense] {
+    var seen = Set<String>()
+
+    return senses.compactMap { sense in
+        let normalizedSense = WordSense(
+            partOfSpeech: sense.partOfSpeech.trimmingCharacters(in: .whitespacesAndNewlines),
+            meaningJapanese: sense.meaningJapanese.trimmingCharacters(in: .whitespacesAndNewlines),
+            exampleSentence: sense.exampleSentence.trimmingCharacters(in: .whitespacesAndNewlines),
+            exampleTranslation: sense.exampleTranslation.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+
+        guard normalizedSense.meaningJapanese.isEmpty == false else {
+            return nil
+        }
+
+        let key = normalizedSense.id
+        guard seen.insert(key).inserted else {
+            return nil
+        }
+
+        return normalizedSense
+    }
+}
+
 struct ContextualMeaning: Codable, Equatable, Identifiable {
     let sentence: String
     let sentenceTranslation: String

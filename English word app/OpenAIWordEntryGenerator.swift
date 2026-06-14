@@ -54,16 +54,20 @@ struct BackendWordEntryGenerator: WordEntryGenerating {
         }
 
         let payload = try JSONDecoder().decode(WordEntryResponse.self, from: data)
+        if payload.exists == false {
+            throw WordGeneratorError.entryNotFound(payload.note ?? "")
+        }
+
         return WordEntryDraft(
             word: payload.word.trimmingCharacters(in: .whitespacesAndNewlines),
-            senses: payload.senses.map {
+            senses: normalizeSensesForStorage(payload.senses.map {
                 WordSense(
                     partOfSpeech: $0.partOfSpeech.trimmingCharacters(in: .whitespacesAndNewlines),
                     meaningJapanese: $0.meaningJapanese.trimmingCharacters(in: .whitespacesAndNewlines),
                     exampleSentence: $0.exampleSentence.trimmingCharacters(in: .whitespacesAndNewlines),
                     exampleTranslation: $0.exampleTranslation.trimmingCharacters(in: .whitespacesAndNewlines)
                 )
-            },
+            }),
             contextualMeanings: (payload.contextualMeanings ?? []).map {
                 ContextualMeaning(
                     sentence: $0.sentence.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -82,9 +86,13 @@ struct BackendConfiguration {
 
     static func load(bundle: Bundle = .main) -> BackendConfiguration? {
         let environment = ProcessInfo.processInfo.environment
-        let baseURLString = environment["WORD_ENTRY_API_BASE_URL"]
+        let configuredBaseURLString = environment["WORD_ENTRY_API_BASE_URL"]
             ?? bundle.object(forInfoDictionaryKey: "WORD_ENTRY_API_BASE_URL") as? String
-            ?? "http://localhost:3000"
+#if DEBUG
+        let baseURLString = configuredBaseURLString ?? "http://localhost:3000"
+#else
+        let baseURLString = configuredBaseURLString ?? ""
+#endif
 
         guard
             baseURLString.isEmpty == false,
@@ -103,6 +111,8 @@ private struct WordEntryRequest: Encodable {
 
 private struct WordEntryResponse: Decodable {
     let word: String
+    let exists: Bool?
+    let note: String?
     let senses: [WordSenseResponse]
     let contextualMeanings: [ContextualMeaningResponse]?
     let generatedBy: String
